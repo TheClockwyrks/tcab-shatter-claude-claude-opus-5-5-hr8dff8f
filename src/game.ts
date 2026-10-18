@@ -1,44 +1,10 @@
-// Shatter — the game. THIS IS THE FILE YOU IMPLEMENT.
+// Shatter — the game: the state it holds, the debug surface that poses and
+// reads that state, and the three functions the engine drives.
 //
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state
-// it holds, the debug surface that poses and reads that state, and the three
-// functions below.
-//
-// FIRST, DECLARE AND EXPORT `ShatterState`, exactly as `specs/state.md` fixes it,
-// and `ShatterDebugApi`, the debug and automation surface
-// `specs/instrumentation.md` specifies. The stub below is written against both
-// names, so this project does not compile until they exist — the type check
-// failing on a freshly seeded workspace is the starting point, not a broken seed.
-//
-// THEN IMPLEMENT the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame — `update`
-// first, with the frame's delta time in SECONDS, then `render`.
-//
-// The state is a VALUE, and every frame is a transition over it. The engine hands
-// `update` the current state as a read-only view (`DeepReadonly<ShatterState>`)
-// and stores whatever `update` returns as the next state; `render` is handed that
-// next state, as the same read-only view, and returns nothing. Nothing ever holds
-// a writable `ShatterState`: `update` builds the next state from the current one
-// (spread the parts that change, `map` over the arrays) rather than assigning into
-// it, and a frame that returns `undefined` is refused by the engine. The engine's
-// own documentation, seeded at `engine/`, defines all of this and the scoped APIs
-// each function receives; read it before you start.
-//
-// The engine hands the frame its real elapsed seconds and mandates no timestep of
-// its own, while `specs/simulation.md` fixes Shatter's at TICK_HZ. Accumulate the
-// delta in the state and run whole ticks while the accumulator holds one, carrying
-// the remainder.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the surface
-// is written in the shape of `update`: a pose takes the current state and returns
-// the next (`setShipPosition(state, x, y)`), a reading takes the state and returns
-// what it read (`snapshot(state)`), and a caller drives them through
-// `engine.apply` and `engine.state`. Where its implementation lives under `src/`
-// is your call; the only fixed point is that `initialize` returns it.
+// `update` reads the frame's input once, converts the frame's delta into whole
+// ticks of the fixed TICK_HZ timestep (carrying the remainder in `tickClock`),
+// and advances the world tick by tick through `src/sim.ts`, which never reads
+// the renderer. `render` (in `src/render.ts`) only draws what it is handed.
 
 import type {
   Game,
@@ -47,63 +13,399 @@ import type {
   UpdateApi,
 } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import { ACTIONS, BINDINGS, CUES, TICK_DT, type RockSize } from "./constants";
+import { CUE_SPECS } from "./audio";
+import { createDebugApi } from "./debug";
+import { registerDiagnostics } from "./diagnostics";
+import { applyPointer, menuItems, moveHighlight } from "./menu";
+import { drawGame, FIELD_COLOR } from "./render";
+import { tick, type TickControls } from "./sim";
+import type { MenuRect, ShatterSnapshot } from "./types";
+import { cloneState, startGame, titleState, type Draft } from "./world";
 
-/**
- * The field background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the field match the field itself. This placeholder is replaced by the build
- * with the color its own field uses.
- */
-export const BACKGROUND = "#000";
+export type Screen = "title" | "howto" | "playing" | "paused" | "gameover";
+export type SaucerEdge = "left" | "right";
+export type FieldEdge = "top" | "bottom" | "left" | "right";
 
-const NOT_IMPLEMENTED = "Shatter: src/game.ts is not implemented yet";
+export interface ShipState {
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly angle: number;
+  readonly thrusting: boolean;
+  readonly invuln: number;
+  readonly collision: boolean;
+  readonly fireCooldown: number;
+}
 
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
+export interface BulletState {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly life: number;
+}
+
+export interface RockState {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly size: RockSize;
+  readonly spin: number;
+  readonly health: number;
+  readonly flash: number;
+}
+
+export interface SaucerState {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly mind: boolean;
+  readonly gun: boolean;
+  readonly travel: boolean;
+  readonly weave: 1 | -1;
+  readonly fireClock: number;
+  readonly weaveClock: number;
+  readonly age: number;
+}
+
+export interface TorpedoState {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly heading: number;
+  readonly life: number;
+  readonly homing: boolean;
+}
+
+/** A burst of debris left where something was destroyed. Cosmetic only. */
+export interface EffectState {
+  readonly kind: "rock" | "ship" | "saucer";
+  readonly x: number;
+  readonly y: number;
+  readonly r: number;
+  /** Seconds the burst has left to show. */
+  readonly t: number;
+  readonly seed: number;
+}
+
+/** A pointer or touch contact that went down on a menu, and the entry it hit. */
+export interface MenuPressState {
+  readonly id: number;
+  readonly item: number;
+}
+
+export interface ShatterState {
+  readonly screen: Screen;
+  readonly menuIndex: number;
+
+  readonly score: number;
+  readonly lives: number;
+  readonly wave: number;
+  readonly waveBanner: number;
+
+  readonly ship: ShipState;
+  readonly bullets: readonly BulletState[];
+  readonly rocks: readonly RockState[];
+  readonly saucer: SaucerState | null;
+  readonly enemyBullets: readonly BulletState[];
+  readonly torpedoes: readonly TorpedoState[];
+  readonly torpedoCharge: number;
+
+  readonly waveSpawning: boolean;
+  readonly saucerSpawning: boolean;
+  readonly saucerClock: number;
+  readonly saucerDue: number;
+
+  readonly nextSaucerEdge: SaucerEdge | null;
+  readonly nextSaucerRow: number | null;
+  readonly nextSaucerAim: number | null;
+  readonly nextRockSpeed: number | null;
+  readonly nextRecycleEdge: FieldEdge | null;
+
+  readonly tickClock: number;
+  readonly nextId: number;
+  readonly simTime: number;
+  readonly muted: boolean;
+
+  // Fields this build adds beside the declared ones. `reset` empties them.
+
+  /** Menu presses awaiting their release, so a confirm spans frames. */
+  readonly menuPress: readonly MenuPressState[];
+  /** A fire press that arrived on a frame that ran no tick. */
+  readonly fireQueued: boolean;
+  /** A torpedo press that arrived on a frame that ran no tick. */
+  readonly torpedoQueued: boolean;
+  /** Seconds left on the extra-ship announcement. */
+  readonly extraLifeTimer: number;
+  /** Debris bursts still showing. */
+  readonly effects: readonly EffectState[];
+}
+
+type View = DeepReadonly<ShatterState>;
+
+/** The debug and automation surface (specs/instrumentation.md). */
+export interface ShatterDebugApi {
+  readonly version: number;
+
+  reset(state: View): ShatterState;
+  snapshot(state: View): ShatterSnapshot;
+  reconcile(state: View): ShatterState;
+  menuItemRect(state: View, index: number): MenuRect | null;
+
+  setScreen(state: View, screen: Screen): ShatterState;
+  setMenuIndex(state: View, n: number): ShatterState;
+  setScore(state: View, n: number): ShatterState;
+  setLives(state: View, n: number): ShatterState;
+  setWave(state: View, n: number): ShatterState;
+  setWaveBanner(state: View, seconds: number): ShatterState;
+
+  setWaveSpawning(state: View, enabled: boolean): ShatterState;
+  setSaucerSpawning(state: View, enabled: boolean): ShatterState;
+  setSaucerDue(state: View, seconds: number): ShatterState;
+
+  setShipPosition(state: View, x: number, y: number): ShatterState;
+  setShipVelocity(state: View, vx: number, vy: number): ShatterState;
+  setShipAngle(state: View, radians: number): ShatterState;
+  setShipInvuln(state: View, seconds: number): ShatterState;
+  setFireCooldown(state: View, ticks: number): ShatterState;
+  setShipCollision(state: View, enabled: boolean): ShatterState;
+
+  addBullet(
+    state: View,
+    x: number,
+    y: number,
+    vx: number,
+    vy: number,
+  ): ShatterState;
+  removeBullet(state: View, id: number): ShatterState;
+  clearBullets(state: View): ShatterState;
+  addEnemyBullet(
+    state: View,
+    x: number,
+    y: number,
+    vx: number,
+    vy: number,
+  ): ShatterState;
+  removeEnemyBullet(state: View, id: number): ShatterState;
+  clearEnemyBullets(state: View): ShatterState;
+
+  addRock(state: View, size: RockSize, x: number, y: number): ShatterState;
+  setRockVelocity(
+    state: View,
+    id: number,
+    vx: number,
+    vy: number,
+  ): ShatterState;
+  setRockHealth(state: View, id: number, hp: number): ShatterState;
+  removeRock(state: View, id: number): ShatterState;
+  clearRocks(state: View): ShatterState;
+
+  addSaucer(state: View, x: number, y: number): ShatterState;
+  setSaucerVelocity(state: View, vx: number, vy: number): ShatterState;
+  setSaucerWeave(state: View, direction: 1 | -1): ShatterState;
+  removeSaucer(state: View): ShatterState;
+  setSaucerMind(state: View, enabled: boolean): ShatterState;
+  setSaucerGun(state: View, enabled: boolean): ShatterState;
+  setSaucerTravel(state: View, enabled: boolean): ShatterState;
+
+  setNextSaucerEdge(state: View, edge: SaucerEdge): ShatterState;
+  setNextSaucerRow(state: View, y: number): ShatterState;
+  setNextSaucerAim(state: View, radians: number): ShatterState;
+  setNextRockSpeed(state: View, speed: number): ShatterState;
+  setNextRecycleEdge(state: View, edge: FieldEdge): ShatterState;
+
+  setTorpedoCharge(state: View, fraction: number): ShatterState;
+  addTorpedo(state: View, x: number, y: number, heading: number): ShatterState;
+  setTorpedoHeading(state: View, id: number, radians: number): ShatterState;
+  setTorpedoHoming(state: View, id: number, enabled: boolean): ShatterState;
+  removeTorpedo(state: View, id: number): ShatterState;
+  clearTorpedoes(state: View): ShatterState;
+}
+
+/** The field background; the letterbox bars are cleared to it too. */
+export const BACKGROUND = FIELD_COLOR;
+
+/** The edges and holds one frame carries, each edge read exactly once. */
+interface FrameInput {
+  readonly up: boolean;
+  readonly down: boolean;
+  readonly confirm: boolean;
+  readonly back: boolean;
+  readonly pause: boolean;
+  readonly fire: boolean;
+  readonly torpedo: boolean;
+  readonly holdUp: boolean;
+  readonly holdLeft: boolean;
+  readonly holdRight: boolean;
+  readonly holdFire: boolean;
+}
+
+function readInput(api: UpdateApi): FrameInput {
+  const { input } = api;
+  return {
+    up: input.pressed("up"),
+    down: input.pressed("down"),
+    confirm: input.pressed("confirm"),
+    back: input.pressed("back"),
+    pause: input.pressed("pause"),
+    fire: input.pressed("a"),
+    torpedo: input.pressed("b"),
+    holdUp: input.value("up") > 0,
+    holdLeft: input.value("left") > 0,
+    holdRight: input.value("right") > 0,
+    holdFire: input.value("a") > 0,
+  };
+}
+
+/** Act on the highlighted entry of the menu `d.screen` shows. */
+function confirmEntry(d: Draft, index: number): void {
+  const items = menuItems(d.screen);
+  const entry = items?.[index];
+  switch (entry) {
+    case "PLAY":
+    case "RESTART":
+    case "PLAY AGAIN":
+      startGame(d);
+      break;
+    case "HOW TO PLAY":
+      d.screen = "howto";
+      d.menuIndex = index;
+      break;
+    case "RESUME":
+      d.screen = "playing";
+      d.menuIndex = 0;
+      break;
+    case "QUIT TO MENU":
+    case "MENU":
+      d.screen = "title";
+      d.menuIndex = 0;
+      break;
+  }
+  d.menuPress = [];
+}
+
+/** Keys first, then the pointer and touch contacts, over a menu screen. */
+function runMenu(d: Draft, input: FrameInput, api: UpdateApi): void {
+  const items = menuItems(d.screen);
+  if (items === null) return;
+  let index = d.menuIndex;
+  if (input.up) index = moveHighlight(index, -1, items.length);
+  if (input.down) index = moveHighlight(index, 1, items.length);
+  d.menuIndex = index;
+  if (input.confirm) {
+    d.menuIndex = moveHighlight(index, 0, items.length);
+    confirmEntry(d, d.menuIndex);
+    return;
+  }
+  const pointer = applyPointer(
+    d.screen,
+    api.input.pointerSamples(),
+    d.menuPress,
+  );
+  d.menuPress = pointer.presses;
+  if (pointer.highlight !== null) d.menuIndex = pointer.highlight;
+  if (pointer.confirm !== null) confirmEntry(d, pointer.confirm);
+}
+
+/** Advance the live field by `ticks` whole ticks. */
+function runPlay(
+  d: Draft,
+  input: FrameInput,
+  ticks: number,
+  cues: Set<string>,
+): void {
+  if (input.fire) d.fireQueued = true;
+  if (input.torpedo) d.torpedoQueued = true;
+  for (let i = 0; i < ticks && d.screen === "playing"; i++) {
+    const controls: TickControls = {
+      turn: (input.holdRight ? 1 : 0) - (input.holdLeft ? 1 : 0),
+      thrust: input.holdUp,
+      fire: input.holdFire || d.fireQueued,
+      torpedo: d.torpedoQueued,
+    };
+    d.fireQueued = false;
+    d.torpedoQueued = false;
+    for (const cue of tick(d, controls).cues) cues.add(cue);
+  }
+  if (d.screen !== "playing") d.ship.thrusting = false;
+}
+
+function advance(state: View, api: UpdateApi, dt: number): ShatterState {
+  const input = readInput(api);
+  if (api.input.pressed("mute")) api.audio.setMuted(!api.audio.muted());
+
+  const d = cloneState(state);
+  const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
+  const carried = d.tickClock + step;
+  const ticks = Math.max(0, Math.floor(carried / TICK_DT + 1e-9));
+  d.tickClock = Math.max(0, carried - ticks * TICK_DT);
+  for (let i = 0; i < ticks; i++) d.simTime += TICK_DT;
+
+  const cues = new Set<string>();
+  switch (d.screen) {
+    case "title":
+    case "gameover":
+      if (input.back && d.screen === "gameover") {
+        d.screen = "title";
+        d.menuIndex = 0;
+      } else {
+        runMenu(d, input, api);
+      }
+      break;
+    case "howto":
+      if (input.back || input.confirm) d.screen = "title";
+      break;
+    case "playing":
+      if (input.pause) {
+        d.screen = "paused";
+        d.menuIndex = 0;
+        d.ship.thrusting = false;
+      } else {
+        runPlay(d, input, ticks, cues);
+      }
+      break;
+    case "paused":
+      if (input.pause || input.back) {
+        d.screen = "playing";
+        d.menuIndex = 0;
+      } else {
+        runMenu(d, input, api);
+      }
+      break;
+  }
+
+  for (const cue of cues) api.audio.play(cue);
+  if (d.screen === "playing" && d.ship.thrusting) api.audio.loop(CUES.thrust);
+  else api.audio.stop(CUES.thrust);
+
+  d.muted = api.audio.muted();
+  return d;
+}
+
+/** The game this build's engine drives. */
 export const game: Game<ShatterState, ShatterDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, define the six CUES,
-   * register the diagnostic sources specs/instrumentation.md lists — each is
-   * handed the state current at the read, so none closes over the state built
-   * here — and build the complete initial state: the title screen, with every
-   * field of ShatterState set. Return it beside the debug surface.
-   */
-  initialize(_api: InitApi<ShatterState>): [ShatterState, ShatterDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  initialize(api: InitApi<ShatterState>): [ShatterState, ShatterDebugApi] {
+    for (const name of ACTIONS) api.input.register(name, BINDINGS[name]);
+    for (const [cue, spec] of Object.entries(CUE_SPECS))
+      api.audio.define(cue, spec);
+    registerDiagnostics(api);
+    return [titleState(false), createDebugApi()];
   },
 
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed SECONDS of this frame. Read input, accumulate it
-   * against Shatter's own fixed timestep and advance the simulation in whole
-   * ticks, play cues, and mirror the engine's mute bit into the returned state's
-   * `muted`. The value returned is what `render` draws and what the next `update`
-   * receives; `state` itself is read-only and stays as it was.
-   */
-  update(
-    _state: DeepReadonly<ShatterState>,
-    _api: UpdateApi,
-    _dt: number,
-  ): ShatterState {
-    throw new Error(NOT_IMPLEMENTED);
+  update(state: View, api: UpdateApi, dt: number): ShatterState {
+    return advance(state, api, dt);
   },
 
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so draw
-   * in 1280x720 coordinates and never read the canvas element's size. The state
-   * arrives read-only, so the type is what guarantees that rendering changes
-   * nothing.
-   */
-  render(_state: DeepReadonly<ShatterState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
+  render(state: View, api: RenderApi): void {
+    drawGame(api.ctx, state);
   },
 };
